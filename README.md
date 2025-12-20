@@ -28,7 +28,7 @@ streamlit run dashboard.py
 To regenerate data from scratch:
 
 ```bash
-python main.py --years 2018 2019 2020 --regenerate
+python main.py --years 2018-2024 --regenerate
 ```
 
 ## Dashboard
