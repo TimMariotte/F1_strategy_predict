@@ -1,0 +1,16 @@
+# cache folders
+f1_cache/
+__pycache__/
+
+# generated plots
+*.png
+
+# html exports
+*.html
+
+# data files (too large for github)
+*.parquet
+
+# python
+*.pyc
+*.pyo

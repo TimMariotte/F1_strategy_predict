@@ -1,0 +1,1742 @@
+﻿high-frequency telemetry and race-dependent conditions.
+
+\vspace{1cm}
+
+\textbf{Keywords:} Formula 1, Machine Learning, Pit Stop Prediction, Telemetry,  
+Anomaly Detection, XGBoost, Autoencoder, Decision Fusion, FastF1.
+
+% ------------------------------------------------------------
+% OPTIONAL ACKNOWLEDGMENTS
+% ------------------------------------------------------------
+
+\chapter*{Acknowledgments}
+\addcontentsline{toc}{chapter}{Acknowledgments}
+
+We thank the FastF1 open-source community for providing access to Formula 1 telemetry data, and our instructors for their guidance during this project.
+
+
+% ============================================================
+% PART 1 — INTRODUCTION (UPDATED WITH MODEL VERSION DISCLAIMER)
+% ============================================================
+
+\chapter{Introduction}
+
+Formula 1 is widely regarded as one of the most technologically advanced and data-intensive sports 
+in the world. Every lap is influenced by a multitude of dynamic factors such as tyre degradation, 
+fuel load, weather conditions, driver behaviour, mechanical stress, traffic, and strategic decisions 
+made by the pit wall. Among these, \textbf{pit stop timing} stands out as one of the most strategically 
+impactful choices a team must make. A well-timed stop can enable an undercut, protect track position, 
+or avoid performance collapse due to failing tyres; a poorly timed stop may compromise an entire race.
+
+Machine learning has recently emerged as a powerful tool for analysing motorsport data, offering the 
+potential to augment human decision-making with data-driven predictions. With the increased availability 
+of telemetry and lap-level timing data through open-source tools such as \texttt{FastF1}, it is now 
+possible to construct predictive models that imitate, support, or challenge the reasoning of professional 
+strategy engineers.
+
+This project proposes a \textbf{complete predictive framework} designed to assist strategic decision-making 
+in Formula 1. It focuses on three major components:
+
+\begin{enumerate}
+    \item \textbf{Predicting the optimal pit stop window} using a multi-headed XGBoost model capable of 
+    estimating both the qualitative pit window category (\textit{imminent, soon, later}) and the expected 
+    number of laps remaining before the next stop.
+
+    \item \textbf{Detecting telemetry-based anomalies} that may indicate mechanical issues, driver mistakes, 
+    or unexpected performance drops. This module uses a fusion of three anomaly detection techniques: 
+    Autoencoder reconstruction error, Isolation Forest, and One-Class SVM.
+
+    \item \textbf{Combining strategy and anomaly predictions into a unified decision score}, producing interpretable 
+    messages such as \textit{“Continue”}, \textit{“Monitor”}, or \textit{“Pit Now”}.
+\end{enumerate}
+
+The integration of these three components seeks to replicate a simplified version of what occurs in a real Formula 1 
+strategy room, where decisions must account simultaneously for tyre condition, race pace, risk levels, and 
+operational constraints. In contrast to deterministic simulation approaches used by professional teams, 
+our system adopts a \textbf{data-driven and model-centric perspective}, focusing on pattern extraction from 
+real historical race telemetry.
+
+\section*{Challenges and Constraints}
+
+Despite the richness of Formula 1 data, the project faces several structural challenges:
+
+\begin{itemize}
+    \item \textbf{Incomplete historical data for older seasons.} Years such as 2018 and 2019 contain inconsistent 
+    or missing telemetry fields in the FastF1 API, making them unsuitable for full model training. This issue 
+    motivated our choice to narrow the predictive scope to seasons where telemetry is complete.
+
+    \item \textbf{High variability across circuits and races.} Each event introduces unique characteristics 
+    (track layout, weather behaviour, tyre compounds, safety car probabilities), requiring the model to 
+    generalize across widely different environments.
+
+    \item \textbf{Inherent unpredictability of race incidents.} Safety Cars, Virtual Safety Cars, and collisions can 
+    drastically alter optimal strategy. These events cannot be predicted reliably from telemetry alone and remain 
+    an unavoidable limitation of any purely data-driven pit strategy model.
+
+    \item \textbf{Heterogeneity of driver styles.} Aggressive vs. conservative drivers produce distinct telemetry 
+    signatures, influencing the model's perception of tyre wear and pace evolution.
+\end{itemize}
+
+% ------------------------------------------------------------
+% NEW DISCLAIMER SECTION INSERTED HERE
+% ------------------------------------------------------------
+
+\section*{Note on Model Versions and Figures Used in This Report}
+
+The screenshots and visual examples included throughout this report were generated using an earlier 
+iteration of the predictive system. Since the time these figures were produced, several improvements 
+have been implemented to enhance the alignment between the model’s pit stop predictions and the 
+actual pit stops performed by teams.
+
+Most notably, the initial version of the pit window classifier (\textit{imminent / soon / later / no stop}) 
+tended to issue alerts slightly too early. Two technical refinements resolved this behaviour:
+
+\begin{itemize}
+    \item \textbf{Addition of a dedicated binary head} predicting whether the car will pit on the \textit{next lap}.  
+    This head learns a shifted label (IsPitLap$_{t+1}$) and generates the probability PredPitNextLapProb.
+
+    \item \textbf{A new fusion strategy} combining pit window probabilities and the next-lap probability 
+    with equal weight (50/50).  
+    When the combined PitUrgency score exceeds 0.5, the system now displays the message 
+    \textit{“Pit expected next lap”}, more accurately matching real pit timing.
+
+    \item \textbf{Class rebalancing} was introduced to compensate for the rarity of pre-pit laps.
+
+    \item \textbf{Optional threshold tuning} (0.4–0.6) enables adapting the sensitivity without overfitting.
+\end{itemize}
+
+These refinements significantly increased the synchronisation with real pit stops, particularly in 
+multi-stint races. However, since the screenshots included in this report reflect the earlier version, 
+they should be interpreted as \textbf{demonstrations of the system’s logic rather than illustrations of 
+its final predictive performance}. The final model yields more precise pit-timing alignment.
+
+% ------------------------------------------------------------
+
+\section*{Objectives of This Report}
+
+This document provides a detailed presentation of the methodology, modelling techniques, experimental 
+results, and limitations encountered during the design of this predictive system. It is structured to 
+reflect the full lifecycle of the project:
+
+\begin{itemize}
+    \item understanding the business motivations behind pit stop prediction,
+    \item describing the dataset and the preprocessing pipeline,
+    \item constructing the feature engineering architecture,
+    \item training and evaluating the strategy and anomaly models,
+    \item designing a decision fusion mechanism,
+    \item and deploying an interactive analytical dashboard with Streamlit.
+\end{itemize}
+
+The goal is not to outperform professional Formula 1 strategy systems, which have access to 
+real-time simulations, tyre degradation models, and proprietary data, but rather to showcase 
+the feasibility of an \textbf{interpretable and modular machine learning pipeline} built using openly 
+accessible data.
+
+This introduction therefore establishes the foundation for the technical chapters that follow, each 
+detailing a specific component of the system, its rationale, its challenges, and its contribution 
+to the final predictive engine.
+
+
+
+% ============================================================
+% PART 2 — BUSINESS CASE
+% ============================================================
+
+\chapter{Business Case}
+
+Pit stop strategy lies at the heart of competitive performance in Formula 1.  
+Although a race may span nearly two hours, crucial decisions often depend  
+on a narrow window of opportunity determined by tyre degradation, race pace, 
+traffic conditions, and unexpected events. A misjudged pit stop can cost multiple 
+positions, while a timely stop can enable a successful undercut or secure track position.  
+For this reason, Formula 1 teams invest heavily in analytics, simulation tools, and 
+historical data to optimize real-time race decisions.
+
+\section{Strategic Importance of Pit Stop Prediction}
+Modern pit stop strategy engineering relies on a combination of pre-race simulations, 
+real-time modelling, and operational constraints such as available tyre sets,  
+fuel loads, and race incidents. However, real-time prediction remains challenging due to:
+\begin{itemize}
+    \item evolving track conditions during the race (rubberization, temperature variations),
+    \item the non-linear behaviour of different tyre compounds,
+    \item interactions with traffic or lapped cars,
+    \item and the influence of driver-specific pace management.
+\end{itemize}
+
+A system capable of forecasting pit stop windows from telemetry offers several advantages:
+\begin{itemize}
+    \item \textbf{Support for strategy engineers} by providing a second, data-driven viewpoint.
+    \item \textbf{Consistency across races}, independent of human bias or race pressure.
+    \item \textbf{Rapid situation assessment} in unexpected race scenarios.
+    \item \textbf{Educational and analytical value} for teams, broadcasters, simulation platforms, or fans.
+\end{itemize}
+
+While this system does not aim to replace professional strategy tools used by F1 teams, 
+it provides a meaningful approximation using publicly accessible data, highlighting the potential of 
+machine learning to interpret complex motorsport telemetry.
+
+\section{Why Anomaly Detection Is Equally Valuable}
+Pit stop timing is not only governed by strategic advantage, but also by mechanical constraints  
+and unexpected events. A sudden loss of pace, overheating brakes, tyre imbalance,  
+or telemetry instability can force an early stop or require immediate monitoring.  
+
+For this reason, the project integrates a secondary objective:
+\begin{quote}
+\textit{Detect abnormal laps using model-based anomaly scoring.}
+\end{quote}
+
+With three heterogeneous models—Autoencoder, Isolation Forest, and One-Class SVM—the anomaly module:
+\begin{itemize}
+    \item highlights laps deviating strongly from expected performance patterns,
+    \item signals potential mechanical or tyre-related issues,
+    \item provides complementary insights to the strategy model,
+    \item increases the interpretability of race incidents beyond simple timing metrics.
+\end{itemize}
+
+For example, an anomalous lap may correspond to:
+\begin{itemize}
+    \item a lock-up (visible as abnormal brake signature),
+    \item a near-spin or traction loss (RPM + speed instability),
+    \item overheating tyres (pace drop + telemetry drift),
+    \item traffic interference or failed overtaking attempts.
+\end{itemize}
+
+Thus, anomaly detection enhances the system’s value by connecting strategy insights 
+with mechanical interpretation.
+
+\section{Decision Fusion as an Operational Tool}
+Predictive systems in motorsport must be interpretable and actionable.  
+Raw model outputs rarely translate directly into race decisions.  
+To address this, the project implements a \textbf{decision fusion layer}, which combines:
+\begin{itemize}
+    \item pit window prediction,
+    \item estimated laps until next stop,
+    \item pit urgency score,
+    \item anomaly severity.
+\end{itemize}
+
+This fused score enables:
+\begin{itemize}
+    \item \textbf{situational awareness}:~understanding whether a lap requires monitoring,
+    \item \textbf{priority signalling}:~detecting critical laps quickly,
+    \item \textbf{high-level messaging}:~``Continue'', ``Monitor'', or ``Pit Now''.
+\end{itemize}
+
+Although simplified compared to real-world F1 strategy rooms, such an approach  
+illustrates how multi-source data can produce operational insights during a race.
+
+\section{Value of a Visual Analytics Dashboard}
+The interactive Streamlit dashboard transforms raw predictions and telemetry signals  
+into a structured visual environment. Users can:
+\begin{itemize}
+    \item explore per-driver, per-event predictions,
+    \item visualize pit urgency curves and compare them to real pit stops,
+    \item inspect anomaly-labelled laps,
+    \item identify telemetry drift or behavioural trends,
+    \item replay the race lap-by-lap.
+\end{itemize}
+
+From a user perspective, this dashboard is an essential bridge between  
+machine learning models and actionable understanding.  
+It provides \textbf{explainability}, \textbf{context}, and \textbf{traceability},  
+three pillars necessary for any real-world analytical system.
+
+\section{Impact of Dataset Limitations on the Project Scope}
+Incomplete telemetry for seasons such as 2018 and 2019 significantly constrained the modelling scope.  
+Missing or inconsistent fields (speed channels, brake/throttle channels, or even lap metadata) prevented 
+training fully reliable models across all seasons.  
+
+As a consequence:
+\begin{itemize}
+    \item the project focuses primarily on accurate predictions for years with complete telemetry,
+    \item long-term multi-season generalization is out of scope,
+    \item the evaluation emphasises interpretability over raw predictive accuracy.
+\end{itemize}
+
+Despite these limitations, the project demonstrates that even partial telemetry datasets  
+can yield meaningful strategic insights through careful engineering.
+
+\section*{Summary of Business Case}
+Overall, the system serves four main purposes:
+\begin{enumerate}
+    \item \textbf{Strategic Support}:~providing predictive signals for pit stop timing.
+    \item \textbf{Mechanical Awareness}:~detecting anomalies likely to influence driver performance.
+    \item \textbf{Interpretability}:~offering transparent and comprehensible insights.
+    \item \textbf{Educational Value}:~illustrating how ML techniques can analyse real F1 telemetry data.
+\end{enumerate}
+
+This business case sets the stage for the technical sections to come,  
+each detailing a major component of the proposed analytical pipeline.
+
+% ============================================================
+% PART 3 — DATASET DESCRIPTION
+% ============================================================
+
+\chapter{Dataset Description}
+
+This project relies heavily on race telemetry and timing data extracted from the 
+\texttt{FastF1} Python library, an open-source framework that provides structured access 
+to Formula 1 session datasets. The library includes information collected from 
+official FIA timing systems, marshals’ data, broadcast feeds, and publicly available 
+telemetry channels. Together, these sources form a multi-layer dataset describing 
+the progression of each race at extremely fine granularity.
+
+\section{Overview of FastF1 Data}
+Each Formula 1 event consists of multiple sessions (Practice, Qualifying, Race),  
+but this project focuses exclusively on \textbf{Race sessions}, where pit stop decisions 
+and performance anomalies have the greatest impact.
+
+FastF1 data is composed of several main blocks:
+
+\begin{itemize}
+    \item \textbf{Lap Timing Data} (per lap, per driver)
+    \begin{itemize}
+        \item lap time,
+        \item sector times,
+        \item tyre compound and tyre life,
+        \item stint number,
+        \item track status flags (green, yellow, VSC, SC).
+    \end{itemize}
+
+    \item \textbf{Telemetry Data} (per car, sampled at $\approx$5--10 Hz)
+    \begin{itemize}
+        \item speed,
+        \item throttle position,
+        \item brake pressure,
+        \item gear and RPM,
+        \item DRS availability and activation points,
+        \item acceleration channels.
+    \end{itemize}
+
+    \item \textbf{Weather and Track Data}
+    \begin{itemize}
+        \item air temperature, track temperature,
+        \item wind speed and direction,
+        \item humidity,
+        \item rainfall flags.
+    \end{itemize}
+
+    \item \textbf{Session Metadata}
+    \begin{itemize}
+        \item circuit name and layout,
+        \item session start time and duration,
+        \item driver identifiers,
+        \item event-specific rules (tyre allocation, available compounds).
+    \end{itemize}
+\end{itemize}
+
+These combined datasets produce a rich representation of the race environment and allow 
+the construction of modelling features describing tyre wear, race pace evolution, and 
+driver behaviour.
+
+\section{Dashboard Example of Extracted Data}
+
+The following figure illustrates an example view from the analytical dashboard built 
+for this project. This screenshot corresponds to the 2018 Monaco Grand Prix for Max Verstappen, 
+showing the user interface used to explore per-driver telemetry and predictions.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Max-Verstappen-MonacoGP-2018-view-dashboard.png}
+    \caption{Example dashboard view displaying session filters and extracted race data.}
+\end{figure}
+
+This dashboard serves as a debugging and exploration interface, providing an intuitive view 
+of the same data later used to train the prediction models.
+
+\section{Structure and Granularity of the Data}
+
+The dataset extracted for each driver–race pair consists of:
+\begin{itemize}
+    \item approximately 50--70 laps,
+    \item 20--40 handcrafted features per lap,
+    \item high-frequency telemetry traces aggregated into lap-level summaries,
+    \item contextual variables such as compound, tyre age, and stint length.
+\end{itemize}
+
+Because telemetry is sampled at a higher rate than laps, aggregation is necessary to convert 
+raw telemetry into modelling features. Examples include:
+\begin{itemize}
+    \item average/brake/throttle ratios per lap,
+    \item maximum and minimum speed in specific zones,
+    \item rolling statistics such as moving-window means or lagged differences.
+\end{itemize}
+
+The combination of lap-level and stint-level features is crucial to modelling tyre behaviour, 
+a key element of pit stop strategy.
+
+\section{Limitations of the Historical Dataset}
+
+Although FastF1 offers a rich amount of telemetry, its historical coverage is not uniform.  
+Older seasons (notably 2018 and 2019) exhibit several issues:
+\begin{itemize}
+    \item missing or incomplete throttle and brake channels,
+    \item inconsistent speed traces for certain cars,
+    \item irregular sampling frequency across telemetry packets,
+    \item absent weather data for several races,
+    \item missing tyre life information for some laps.
+\end{itemize}
+
+These limitations significantly compromise model reliability.  
+For example, predicting pit windows requires features such as:
+\begin{itemize}
+    \item \texttt{StintLength},
+    \item \texttt{StintProgressRatio},
+    \item \texttt{LapsSincePrevPit},
+    \item and lap-level speed degradation indicators.
+\end{itemize}
+
+If any of these are missing or inconsistent, the predictive signal becomes unreliable.  
+As a direct consequence, the project scope was intentionally narrowed:
+
+\begin{quote}
+\textit{The system focuses on seasons where telemetry is complete, stable,  
+and properly aligned, ensuring high-quality input for the prediction models.}
+\end{quote}
+
+This design choice allows for more consistent feature engineering and avoids injecting 
+noise into the learning pipeline.
+
+\section{Dataset Suitability for Machine Learning}
+
+From a machine learning perspective, the dataset presents a mix of advantages and challenges:
+
+\subsection*{Advantages}
+\begin{itemize}
+    \item Laps provide a natural temporal structure for supervised learning.
+    \item Telemetry-derived features capture driver behaviour and tyre condition.
+    \item Weather and stint metadata add contextual depth.
+\end{itemize}
+
+\subsection*{Challenges}
+\begin{itemize}
+    \item Races vary considerably in length and structure.
+    \item Telemetry noise must be smoothed or aggregated.
+    \item Missing values must be imputed or avoided entirely.
+    \item Cross-race generalization is difficult due to circuit-specific effects.
+\end{itemize}
+
+Despite these challenges, the dataset is well-suited for constructing interpretable models 
+provided that preprocessing is performed with care.
+
+\section*{Summary}
+In summary, the FastF1 dataset offers a multi-layer, high-dimensional view of Formula 1 races.  
+Its combination of timing data, telemetry signals, weather information, and stint metadata makes it 
+well-suited for pit stop modelling, with the caveat that older seasons may require exclusion due to 
+incomplete telemetry. This dataset forms the foundation for the feature engineering and modelling 
+approaches described in the following chapters.
+
+% ============================================================
+% PART 4 — DATA PREPROCESSING AND FEATURE ENGINEERING
+% ============================================================
+
+\chapter{Data Preprocessing and Feature Engineering}
+
+High-quality feature engineering is essential for modelling tyre degradation, race pace,
+and telemetry-driven behaviours in Formula 1. Raw telemetry and timing data provided by
+\texttt{FastF1} require extensive preparation before they can be used in predictive models.
+This chapter describes the full preprocessing pipeline, the rationale behind each feature,
+and the methods used to transform noisy lap-level and high-frequency data into
+structured machine learning inputs.
+
+\section{Data Cleaning and Standardization}
+
+Upon loading race sessions through FastF1, several cleaning steps are performed:
+
+\begin{itemize}
+    \item \textbf{Removal of invalid laps:} laps containing red-flag interruptions,
+    pit-lane-only movement, or incomplete timing data are excluded.
+    \item \textbf{Alignment of telemetry packets:} telemetry channels (Speed, Throttle,
+    Brake, RPM) often have slight sampling inconsistencies which are corrected by resampling
+    and interpolating missing points when necessary.
+    \item \textbf{Standardization of column names and formats:} ensuring that lap time,
+    sector times, tyre compound, and tyre age are always present in a consistent format.
+    \item \textbf{Conversion of delta time formats:} lap times stored as timestamps
+    are converted into seconds using the pandas \texttt{to\_timedelta} operation.
+\end{itemize}
+
+Cleaning ensures that downstream models are not polluted by irregular or incomplete data.
+
+\section{Lap-Level Telemetry Aggregation}
+
+Telemetry is sampled at approximately 5--10 Hz, whereas lap-level features operate on a
+single-row-per-lap structure. Therefore, telemetry traces must be summarized.
+For each lap, the following aggregated features are computed:
+
+\begin{itemize}
+    \item \textbf{Mean speed, maximum speed, minimum speed}
+    \item \textbf{Standard deviation of speed} (pace consistency)
+    \item \textbf{Percentage of full-throttle usage} (Throttle $\geq 98\%$)
+    \item \textbf{Percentage of braking time}
+    \item \textbf{DRS activation flag} (binary)
+    \item \textbf{Mean RPM, maximum RPM}
+    \item \textbf{Acceleration metrics} (mean, max absolute acceleration)
+\end{itemize}
+
+These variables help the model infer tyre degradation patterns, driving style, and pace evolution.
+
+The following figure illustrates telemetry-derived signals for Max Verstappen
+during the 2018 Monaco Grand Prix, giving insight into throttle and brake behaviour,
+as well as speed distribution across laps.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Max-Verstappen-MonacoGP-2018-sensors-throttle-break-speed.png}
+    \caption{Telemetry-derived features aggregated over laps: throttle, brake, and speed distribution.}
+\end{figure}
+
+\section{Stint-Level Feature Construction}
+
+Tyre behaviour in Formula 1 is strongly tied to stints: the number of laps completed on a
+given compound significantly affects pace and degradation. The following features are constructed:
+
+\begin{itemize}
+    \item \textbf{StintLength:} total number of laps in the current stint.
+    \item \textbf{StintProgressRatio:} current lap position within the stint
+    ($\frac{\text{LapsSincePit}}{\text{StintLength}}$).
+    \item \textbf{LapsSincePrevPit:} time since the last pit stop.
+    \item \textbf{TyreLife:} age of the tyre in laps (provided by FastF1 when available).
+\end{itemize}
+
+These features are essential for pit window prediction, as tyre performance typically
+follows a non-linear degradation curve.
+
+\section{Weather and Track Condition Features}
+
+Weather conditions influence tyre temperature, grip levels, and cooling efficiency.
+The following features are integrated whenever available:
+
+\begin{itemize}
+    \item \textbf{Track temperature} and \textbf{air temperature}
+    \item \textbf{Wind speed} and \textbf{wind direction}
+    \item \textbf{Humidity}
+    \item \textbf{Track status} (green, yellow, VSC, SC)
+\end{itemize}
+
+These variables add contextual knowledge to the predictive model, capturing environmental
+effects that influence tyre wear and pace variation.
+
+\section{Rolling and Lag-Based Features}
+
+To model temporal behaviour and degradation trends, several rolling-window features are computed:
+
+\begin{itemize}
+    \item \textbf{Rolling mean lap time} over the past 3--5 laps
+    \item \textbf{Lap time deltas} (\texttt{LapTime\_t} $-$ \texttt{LapTime\_{t-1}})
+    \item \textbf{Rolling standard deviation of speed} (pace stability)
+    \item \textbf{Short-term vs long-term averages} to detect pace drift
+\end{itemize}
+
+These engineered features embed crucial information about short-term pace evolution,
+helping the model detect when tyres begin to fall off or when the driver struggles maintaining rhythm.
+
+\section{Feature Justification for Machine Learning}
+
+The final feature set combines:
+\begin{itemize}
+    \item high-frequency telemetry summaries,
+    \item contextual metadata (compound, tyre life, track temperature),
+    \item temporal descriptors (rolling windows, lag features),
+    \item stint-level variables (position within tyre cycle).
+\end{itemize}
+
+This structured representation is particularly suitable for tree-based models such as XGBoost,
+which benefit from:
+\begin{itemize}
+    \item explicit non-linear interactions (e.g., tyre life × track temperature),
+    \item hierarchical splits capturing degradation curves,
+    \item robustness to missing or noisy telemetry segments.
+\end{itemize}
+
+\section{Challenges in Feature Engineering}
+
+Several difficulties arise during preprocessing:
+
+\begin{itemize}
+    \item \textbf{Telemetry sampling irregularities} can lead to distorted lap summaries if not corrected.
+    \item \textbf{Missing dataset fields} (notably in 2018--2019) prevent consistent feature computation.
+    \item \textbf{Driver-specific behaviour} affects statistical stability across the dataset.
+    \item \textbf{Cross-circuit variability} requires the model to generalize over heterogeneous race conditions.
+\end{itemize}
+
+Despite these challenges, the engineered dataset proved highly informative for both pit window prediction
+and anomaly scoring.
+
+\section*{Summary}
+
+This preprocessing and feature engineering pipeline transforms raw telemetry into a clean,
+structured, multi-dimensional representation of race dynamics. It provides the foundation for the
+predictive strategy and anomaly detection models described in the next chapters.
+
+% ============================================================
+% PART 5 — PREDICTIVE STRATEGY MODEL
+% ============================================================
+
+\chapter{Predictive Strategy Model}
+
+Predicting the optimal pit stop window is a highly complex task influenced by tyre degradation,
+driver behaviour, fuel load, track conditions, and race incidents.  
+To address this challenge, the project adopts a \textbf{multi-headed XGBoost model} that simultaneously
+predicts multiple strategy signals describing the likelihood, timing, and urgency of the next pit stop.
+
+This chapter presents the modelling architecture, feature set, metrics, and visual results obtained
+from the strategy prediction models.
+
+\section{Rationale for Using XGBoost}
+
+XGBoost was selected as the primary modelling framework for several reasons:
+
+\begin{itemize}
+    \item \textbf{Excellent performance on structured/tabular data}, outperforming classical models
+    such as logistic regression or random forests.
+    \item \textbf{Ability to capture non-linear interactions}, e.g., tyre age interacting with speed degradation.
+    \item \textbf{Robustness to outliers and missing values}.
+    \item \textbf{Automatic handling of feature importance}, providing interpretability.
+    \item \textbf{Fast training times} and easy hyperparameter tuning.
+\end{itemize}
+
+In a domain as variable as Formula 1, where conditions shift rapidly and telemetry data is often noisy,
+XGBoost offers a strong balance of accuracy, robustness, and transparency.
+
+\section{Multi-Head Modelling Approach}
+
+Pit stop timing is not a single-value prediction problem.  
+Instead, the system predicts multiple complementary outputs that together describe the strategic situation.
+
+Therefore, the strategy model consists of three heads:
+
+\begin{enumerate}
+    \item \textbf{Pit Window Classification}:  
+    A multi-class classifier predicting whether a pit stop is:
+    \begin{itemize}
+        \item imminent (0--2 laps),
+        \item soon (3--6 laps),
+        \item later (beyond 6 laps),
+        \item not expected (no stop foreseen).
+    \end{itemize}
+
+    \item \textbf{Next Pit Gap Regression}:  
+    A regression head predicting the estimated number of laps before the next stop.
+
+    \item \textbf{Binary Pit Prediction for the Next Lap}:  
+    A classifier estimating the probability that the driver will pit in the \textbf{very next lap}.
+\end{enumerate}
+
+The combination of these three signals forms the basis for the \textit{PitUrgency} metric and the final
+decision fusion module.
+
+\section{Input Features for the Strategy Model}
+
+The strategy model uses the engineered dataset described in Chapter 4, including:
+
+\begin{itemize}
+    \item \textbf{Lap-level telemetry summaries}: speed, throttle, brake, RPM.
+    \item \textbf{Stint-level variables}: tyre life, laps since previous stop, stint progress ratio.
+    \item \textbf{Weather features}: track/air temperature, wind speed.
+    \item \textbf{Rolling features}: short-term vs long-term pace drift.
+    \item \textbf{Compound metadata}: soft vs medium vs hard behaviour.
+\end{itemize}
+
+These inputs allow the model to approximate underlying tyre degradation dynamics.
+
+\section{Model Insights and Interpretation}
+
+The following figure illustrates the model predictions and pit window probabilities for
+Max Verstappen during the 2018 Monaco Grand Prix.  
+The coloured segments represent confidence levels for each pit window class.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Max-Verstappen-MonacoGP-2018-strategy-model-insights.png}
+    \caption{Strategy model insights showing predicted pit window class and pit timing indicators.}
+\end{figure}
+
+This visual demonstrates that the model successfully identifies the growing pit window risk
+and aligns well with the real pit stop timing.
+
+\section{Feature Importance for Pit Window Prediction}
+
+To better understand the model's behaviour, we computed the XGBoost feature importance rankings.
+These rankings reveal which factors influence the pit window classification most strongly.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{Max-Verstappen-MonacoGP-2018-strategy-model-feature-importance-PitWindow.png}
+    \caption{Feature importance for Pit Window classification head (XGBoost).}
+\end{figure}
+
+Key observations include:
+
+\begin{itemize}
+    \item \textbf{Tyre Life} and \textbf{LapsSincePrevPit} are dominant, confirming the model's reliance
+    on stint progression.
+    \item \textbf{Rolling mean lap time} and \textbf{long-term pace drift} are essential for
+    detecting degradation.
+    \item Telemetry-derived variables such as \textbf{throttle percentage} and \textbf{speed stability}
+    also contribute significantly.
+\end{itemize}
+
+These importance curves validate the strategy model’s interpretability and confirm that it identifies
+strategically meaningful features.
+
+\section{Pit Stop Prediction Curves}
+
+Pit stop timing predictions can be visualized by plotting the \textit{PitUrgency} curve across laps
+and comparing it to the actual pit stops performed during the race.
+
+\subsection*{Example 1: Max Verstappen — Monaco GP 2018}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Max-Verstappen-MonacoGP-2018-pitstop-graph-prediction.png}
+    \caption{Pit stop prediction curve vs. real stop for Max Verstappen at Monaco 2018.}
+\end{figure}
+
+\subsection*{Example 2: Lewis Hamilton — Canadian GP 2022 (Two-Stop Strategy)}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Other-example-Lewis-Hamilton-CanadianGP-2022-pitstop-graph-prediction-2-stops.png}
+    \caption{Prediction curve for a two-stop strategy: Lewis Hamilton, Canadian GP 2022.}
+\end{figure}
+
+\subsection*{Example 3: Pierre Gasly — Bahrain GP 2023 (Three-Stop Strategy)}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Other-example-Pierre-Gasly-BahrainGP-2023-pitstop-graph-prediction-3-stops.png}
+    \caption{Prediction curve for a three-stop strategy: Pierre Gasly, Bahrain GP 2023.}
+\end{figure}
+
+These visualisations show that:
+
+\begin{itemize}
+    \item The model successfully identifies pit windows even across varying strategy profiles
+    (one-stop, two-stop, three-stop races).
+    \item The predicted urgency rises sharply as tyre degradation becomes critical.
+    \item The system is robust across drivers, compounds, and circuits.
+\end{itemize}
+
+\section{Model Evaluation and Metrics}
+
+The following metrics were used to assess prediction quality:
+
+\begin{itemize}
+    \item \textbf{Macro-F1 Score} for Pit Window Classification  
+    (balances performance across all classes, even rare ones).
+    \item \textbf{Mean Absolute Error (MAE)} for Next Pit Gap Regression.
+    \item \textbf{Calibration and reliability curves} for the next-lap binary classifier.
+\end{itemize}
+
+These metrics ensure that the model is evaluated from both a classification and a regression perspective,
+reflecting the multi-task nature of pit strategy prediction.
+
+\section*{Summary}
+
+The strategy model provides a robust approximation of pit timing patterns across different races.
+While it does not replicate full team-level simulation engines used in Formula 1, it captures meaningful
+relationships between tyre age, telemetry behaviour, and degradation trends. The resulting pit window
+predictions form a crucial component of the decision fusion system described later in the report.
+
+% ============================================================
+% PART 6 — ANOMALY DETECTION MODELS
+% ============================================================
+
+\chapter{Anomaly Detection Models}
+
+While pit stop strategies primarily depend on tyre degradation and race evolution,
+unexpected events can drastically influence the optimal timing of a stop.  
+Mechanical issues, tyre overheating, brake instability, or sudden loss of pace
+can force a driver to pit earlier than planned.  
+For this reason, the project incorporates a dedicated \textbf{anomaly detection module}
+to identify outlier laps based on telemetry behaviour and performance drift.
+
+This chapter describes the three anomaly models used (Autoencoder, Isolation Forest,
+One-Class SVM), the fusion mechanism, and the interpretation of detected events.
+
+\section{Motivation for Telemetry-Based Anomaly Detection}
+
+Anomalies in Formula 1 telemetry can correspond to:
+
+\begin{itemize}
+    \item brake overheating or excessive braking frequency,
+    \item tyre temperature imbalance or loss of grip,
+    \item temporary engine derating (RPM irregularities),
+    \item driver mistakes, near-spins, or traction loss,
+    \item slow laps caused by traffic or yellow flags,
+    \item sensor irregularities or unexpected data behaviour.
+\end{itemize}
+
+These anomalies are strategically relevant because they:
+
+\begin{itemize}
+    \item distort performance estimates used for pit timing,
+    \item may signal developing mechanical issues,
+    \item affect degradation predictions,
+    \item help differentiate slow laps caused by danger vs.~strategy.
+\end{itemize}
+
+Thus, detecting anomalies complements the pit strategy model by providing a 
+\textit{risk-awareness layer} on top of tyre and pace indicators.
+
+\section{Feature Set for Anomaly Detection}
+
+The anomaly module uses a subset of the engineered features described in Chapter 4, primarily:
+
+\begin{itemize}
+    \item lap time in seconds,
+    \item tyre life and stint number,
+    \item mean, max, and min speed,
+    \item throttle percentage and brake percentage,
+    \item DRS activation flag,
+    \item rolling averages of pace and speed drift,
+    \item acceleration metrics,
+    \item weather-based contextual features.
+\end{itemize}
+
+Before modelling, laps considered “normal” are filtered to exclude:
+
+\begin{itemize}
+    \item pit laps,
+    \item laps with extreme slow pace (>15\% slower than race median),
+    \item formation laps or laps immediately after a restart.
+\end{itemize}
+
+This ensures that models learn meaningful behaviour rather than encoding structural outliers.
+
+\section{Autoencoder Model}
+
+The first anomaly detection component is a \textbf{shallow Autoencoder}, consisting of:
+
+\begin{itemize}
+    \item an encoder compressing the feature vector into a latent 4-dimensional space,
+    \item a decoder reconstructing the original input.
+\end{itemize}
+
+After training on normal laps, reconstruction error becomes a measure of abnormality.
+
+Let $x$ be the input lap feature vector, and $\hat{x}$ the reconstruction.  
+The anomaly score is defined as:
+
+\[
+\text{Error}(x) = \| x - \hat{x} \|_{1}.
+\]
+
+High reconstruction error indicates patterns unseen during training.
+
+Advantages:
+\begin{itemize}
+    \item captures subtle non-linear behaviours,
+    \item sensitive to unusual telemetry combinations,
+    \item scalable with additional features.
+\end{itemize}
+
+\section{Isolation Forest}
+
+The \textbf{Isolation Forest} isolates anomalies by recursively partitioning the data space.
+Points requiring fewer cuts to isolate are considered anomalies.
+
+Key strengths:
+\begin{itemize}
+    \item efficient for high-dimensional inputs,
+    \item robust to noisy features,
+    \item independent of data distribution assumptions.
+\end{itemize}
+
+\section{One-Class SVM}
+
+The \textbf{One-Class SVM} models the boundary of normal telemetry and flags points
+outside this boundary as anomalies.
+
+Its advantages include:
+\begin{itemize}
+    \item effective detection of boundary anomalies,
+    \item good performance with moderately sized datasets,
+    \item ability to detect small but consistent deviations in behaviour.
+\end{itemize}
+
+\section{Fusion of Anomaly Models}
+
+To stabilize predictions, the three anomaly scores are normalized and combined into a
+single fused anomaly score:
+
+\[
+\text{AnomalyScore} = 0.5 \cdot \text{AE} + 0.3 \cdot \text{IF} + 0.2 \cdot \text{OCS},
+\]
+
+where AE, IF, and OCS represent the normalized errors from the Autoencoder,
+Isolation Forest, and One-Class SVM respectively.
+
+Additionally, the anomaly threshold is not global but \textbf{event-specific}:
+each race computes its own 99.5th percentile threshold to account for variation 
+between circuits.
+
+\[
+\text{IsAnomaly}(x) = 
+\begin{cases}
+1, & \text{if } \text{AnomalyScore}(x) > \text{Threshold}_{\text{event}}, \\
+0, & \text{otherwise}.
+\end{cases}
+\]
+
+This ensures robustness across circuits with different pace patterns.
+
+\section{Examples of Detected Anomalies}
+
+The following figures show anomaly detection results for Lewis Hamilton  
+during the 2022 Canadian Grand Prix.
+
+\subsection*{Example 1: Anomaly Score Spike}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Example-anomaly-lap-graph-Lewis-hamilton-2022-CanadianGP.png}
+    \caption{Anomaly score and lap time deviation: Hamilton, 2022 Canadian GP.}
+\end{figure}
+
+\subsection*{Example 2: Laps Classified as Anomalous}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{Example-anomaly-lap-Lewis-hamilton-2022-CanadianGP.png}
+    \caption{Telemetry analysis of anomalous laps detected by the fused anomaly model.}
+\end{figure}
+
+These anomalies correspond to:
+\begin{itemize}
+    \item irregular braking patterns,
+    \item sudden changes in throttle application,
+    \item pace drops caused by traffic or overheating tyres.
+\end{itemize}
+
+Such laps are valuable for strategy engineers because they inform whether a performance drop is:
+\begin{itemize}
+    \item strategic (normal degradation),
+    \item mechanical (requires attention),
+    \item or situational (traffic, yellow flag).
+\end{itemize}
+
+\section{Limitations of Anomaly Detection}
+
+While useful, anomaly detection is subject to several limitations:
+
+\begin{itemize}
+    \item anomalies due to yellow flags or safety car are not distinguishable from mechanical issues,
+    \item telemetry noise may produce false positives,
+    \item model performance depends on the quality of the filtered “normal laps” dataset,
+    \item anomalies do not always imply the need for a pit stop.
+\end{itemize}
+
+Nevertheless, anomaly scoring provides essential insights that enhance situational awareness
+in combination with the strategy model.
+
+\section*{Summary}
+
+The anomaly detection module identifies abnormal laps that would otherwise distort degradation
+estimates or pit timing predictions. By combining three complementary models and adapting thresholds 
+per race, the system achieves robust anomaly classification across circuits, drivers, and conditions.
+
+These anomaly signals are later integrated into the decision fusion mechanism described in Chapter 7.
+
+% ============================================================
+% PART 7 — DECISION FUSION
+% ============================================================
+
+\chapter{Decision Fusion}
+
+Pit stop strategy in Formula 1 is never determined by a single variable.  
+Tyre wear, race pace, driver behaviour, environmental conditions, and unexpected anomalies  
+all interact to shape the optimal moment to perform a pit stop.  
+To capture this complexity, the project introduces a \textbf{decision fusion layer}  
+that consolidates the outputs of the strategy model and the anomaly detection module  
+into a unified decision score and human-readable recommendation.
+
+This chapter describes the rationale, mathematical formulation, and practical behaviour  
+of the decision fusion system.
+
+\section{Motivation for Multi-Signal Fusion}
+
+The strategy model predicts the \textit{expected} pit window and timing based on tyre degradation patterns  
+and race evolution.  
+However, real races also involve:
+
+\begin{itemize}
+    \item sudden pace drops,
+    \item mechanical issues,
+    \item unexpected telemetry behaviour,
+    \item environmental changes,
+    \item traffic-induced losses,
+    \item and emerging risks.
+\end{itemize}
+
+These factors are captured by the anomaly detection module, which identifies laps deviating  
+from normal telemetry patterns.
+
+For operational relevance, both sources of information must be combined:
+
+\begin{quote}
+\textit{The decision fusion layer provides a single actionable output summarizing race strategy and mechanical condition.}
+\end{quote}
+
+\section{Components of the Fusion System}
+
+The fusion module uses several intermediate signals:
+
+\begin{enumerate}
+    \item \textbf{Pit Window Probabilities}  
+    (imminent, soon, later) — obtained from the classification head of the strategy model.
+
+    \item \textbf{Next-Lap Pit Probability}  
+    — from the binary classifier predicting whether the driver will pit on the next lap.
+
+    \item \textbf{PitUrgency Score}  
+    — a weighted combination of the pit window and next-lap probabilities.
+
+    \item \textbf{AnomalySeverity Score}  
+    — the normalized anomaly score representing mechanical/behavioural risks.
+\end{enumerate}
+
+These signals are merged to compute the final \textbf{DecisionScore}.
+
+\section{Fusion of Strategy Signals}
+
+The two strategy-related signals are combined as follows:
+
+\[
+\text{PitUrgency} =
+0.5 \cdot P_{\text{NextLap}} + 
+0.7 \cdot P_{\text{Imminent}} +
+0.3 \cdot P_{\text{Soon}}.
+\]
+
+This formula reflects that:
+\begin{itemize}
+    \item an imminent pit window is more impactful than a “soon” prediction,
+    \item next-lap probability has high operational value (short-term urgency).
+\end{itemize}
+
+The resulting score is normalized to the range $[0, 1]$.
+
+\section{Fusion of Anomaly Signals}
+
+The anomaly fusion described in Chapter 6 yields a score:
+
+\[
+\text{AnomalySeverity} \in [0, 1].
+\]
+
+This score represents:
+\begin{itemize}
+    \item mechanical stress,
+    \item telemetry instability,
+    \item severe pace loss,
+    \item or inconsistent driver behaviour.
+\end{itemize}
+
+High anomaly severity can indicate the need for earlier-than-planned pits.
+
+\section{Final Decision Score}
+
+The final unified decision score is computed as:
+
+\[
+\text{DecisionScore} = 100 \cdot 
+\left(
+0.6 \cdot \text{PitUrgency}
++ 0.4 \cdot \text{AnomalySeverity}
+\right).
+\]
+
+Weights were chosen empirically:
+
+\begin{itemize}
+    \item \textbf{60\% strategy}: tyre-related degradation remains the primary reason for pit stops.
+    \item \textbf{40\% anomaly}: mechanical risk and performance drops also matter but do not dominate.
+\end{itemize}
+
+The score lies in the range $[0, 100]$ and maps directly to actionable messages.
+
+\section{Decision Messages}
+
+To make the model interpretable, the fusion layer assigns a qualitative message  
+based on the DecisionScore and detected anomalies.
+
+\begin{itemize}
+    \item \textbf{Continue} — low urgency, stable telemetry.  
+    \item \textbf{Monitor} — emerging risk, possible pit window approaching.  
+    \item \textbf{Pit Now} — high urgency or critical anomaly detected.  
+\end{itemize}
+
+Additionally, if the anomaly detection module flags a severe anomaly:
+
+\[
+\text{If IsAnomaly = 1, message} \rightarrow \text{``Alert: abnormal telemetry behaviour''}.
+\]
+
+This ensures that mechanical or pace-related issues receive priority over strategic degradation alone.
+
+\section{Interpretation and Practical Behaviour}
+
+Examples from real races show that the fusion model behaves realistically:
+
+\begin{itemize}
+    \item PitUrgency increases progressively as tyres wear out naturally.
+    \item Abrupt anomaly spikes trigger immediate cautionary messages.
+    \item The unified score peaks shortly before real pit stops, validating the model’s predictions.
+    \item Multi-stop strategies (two or three stops) exhibit multiple urgency cycles.
+\end{itemize}
+
+This behaviour is consistent with the way professional strategy teams 
+track short-term degradation and risk levels.
+
+\section{Limitations of Decision Fusion}
+
+Although effective, the fusion approach faces several constraints:
+
+\begin{itemize}
+    \item \textbf{Safety Cars and race incidents are unpredictable}.  
+    No telemetry model can reliably predict these events.  
+    When a Safety Car is deployed, pit decisions depend on external rules and 
+    strategic trade-offs unrelated to telemetry (track position loss, tyre delta, etc.).
+
+    \item \textbf{Driver-specific behaviour can bias urgency curves}.  
+    Some drivers consistently brake harder, push tyres more, or manage pace differently.
+
+    \item \textbf{Circuit-specific effects}.  
+    Circuits with high degradation (e.g., Bahrain) behave differently from low-degradation tracks (e.g., Monaco).
+
+    \item \textbf{Anomalies do not always imply pit stops}.  
+    A traffic-induced anomaly should not trigger a pit stop recommendation.
+\end{itemize}
+
+Despite these limitations, the fusion model provides a coherent, interpretable, and 
+operationally meaningful way to summarize complex race dynamics.
+
+\section*{Summary}
+
+The decision fusion module synthesizes tyre-related strategy signals and telemetry anomalies
+into a single high-level recommendation.  
+It forms the core operational output of the system, bridging predictive analytics with 
+race engineering interpretation.  
+The next chapters describe how this fused information is surfaced within an interactive dashboard  
+and how race-specific factors such as Safety Cars affect predictive validity.
+
+
+% ============================================================
+% PART 8 — STREAMLIT DASHBOARD
+% ============================================================
+
+\chapter{Interactive Dashboard (Streamlit UI)}
+
+While machine learning models generate valuable predictive signals, their usefulness  
+depends heavily on how clearly these signals can be explored, interpreted, and compared  
+with real race events.  
+To bridge the gap between model outputs and user understanding, the project includes  
+a dedicated \textbf{interactive dashboard} built with Streamlit.
+
+This dashboard serves multiple purposes:
+\begin{itemize}
+    \item providing a transparent view of the dataset used for modelling,
+    \item visualising prediction curves and anomaly detections,
+    \item enabling users to inspect telemetry-derived behaviours,
+    \item supporting side-by-side comparison between real and predicted pit stops,
+    \item offering an educational and analytical interface for exploring Formula 1 telemetry data.
+\end{itemize}
+
+\section{Motivation for a Visual Interface}
+
+Raw numerical predictions are insufficient for real-world interpretation:
+\begin{itemize}
+    \item engineers need to understand \textit{why} a model predicts a pit stop soon,
+    \item telemetry anomalies must be contextualized relative to lap timings,
+    \item strategy curves must be overlaid with real pit stops to assess correctness,
+    \item degradation patterns must be visualised to ensure model validity.
+\end{itemize}
+
+Thus, an interactive interface becomes essential—not only as a presentation tool but  
+as a \textbf{diagnostic instrument} during development.
+
+\section{Dashboard Structure}
+
+The Streamlit UI is organized around a set of user-driven filters and visual modules:
+
+\begin{itemize}
+    \item \textbf{Session Filters}  
+    Users select:
+    \begin{itemize}
+        \item the race year,
+        \item the event (Grand Prix),
+        \item the driver,
+        \item optional lap-replay scrubbing.
+    \end{itemize}
+
+    \item \textbf{Key Performance Indicators (KPIs)}  
+    Simple metrics summarizing:
+    \begin{itemize}
+        \item number of anomalies detected,
+        \item average decision score,
+        \item average pit urgency.
+    \end{itemize}
+
+    \item \textbf{Anomaly Analysis Module}  
+    Displays:
+    \begin{itemize}
+        \item list of laps classified as anomalies,
+        \item anomaly scores and reconstruction errors,
+        \item lap time scatter plots with outliers highlighted.
+    \end{itemize}
+
+    \item \textbf{Strategy Model Insights}  
+    Includes:
+    \begin{itemize}
+        \item pit window class predictions,
+        \item next-lap pit probability,
+        \item recommended pit-lap predictions,
+        \item decision score evolution.
+    \end{itemize}
+
+    \item \textbf{Pit Stop Comparison}  
+    Overlays predicted pit windows with real pit stops.
+
+    \item \textbf{Multi-Sensor Telemetry Overview}  
+    Plots mean speed, throttle ratio, brake percentage, and other aggregated signals.
+\end{itemize}
+
+\section{Illustration of the Dashboard UI}
+
+The screenshot below shows an example of the dashboard in use, visualising race selections  
+and telemetry summaries for Max Verstappen during the 2018 Monaco Grand Prix.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Max-Verstappen-MonacoGP-2018-view-dashboard.png}
+    \caption{Example of the Streamlit dashboard used to explore telemetry, anomalies, and pit strategy predictions.}
+\end{figure}
+
+The dashboard provides an intuitive gateway through which users can interpret all components  
+of the predictive pipeline.
+
+\section{Integration with the Predictive Pipeline}
+
+The dashboard imports the processed DataFrame enriched with:
+\begin{itemize}
+    \item pit window predictions,
+    \item recommended pit lap,
+    \item pit urgency,
+    \item prediction probabilities,
+    \item anomaly flags and severity scores,
+    \item decision score and messages.
+\end{itemize}
+
+Because the dashboard uses \texttt{Streamlit}'s reactive architecture,  
+all visual components automatically update whenever a user changes filters or interacts  
+with the lap selection controls.
+
+This allows:
+\begin{itemize}
+    \item per-lap inspection of model behaviour,
+    \item easy identification of laps where predictions diverge from reality,
+    \item direct comparison of anomalies and pit predictions,
+    \item validation of feature engineering and preprocessing steps.
+\end{itemize}
+
+\section{Role in Model Development and Evaluation}
+
+Throughout the development of the predictive system, the dashboard served as:
+
+\begin{itemize}
+    \item a \textbf{debugging tool} to verify feature correctness,
+    \item a \textbf{model validation tool} to evaluate predictions against real pit stops,
+    \item an \textbf{exploration interface} for discovering unexpected behavioural patterns,
+    \item a \textbf{communication medium} to present results in a clear and compelling way.
+\end{itemize}
+
+For example, overlaying anomaly detection with strategy signals revealed cases where:
+\begin{itemize}
+    \item unexpected tyre drop-off triggered both anomaly spikes and strategy urgency rises,
+    \item traffic-induced anomalies did \textit{not} correspond to pit stop necessity,
+    \item Safety Car phases altered pace dynamics in ways the model cannot anticipate.
+\end{itemize}
+
+\section{Benefits of a Visual Analytics Layer}
+
+The dashboard adds significant value to the system by enabling:
+
+\begin{itemize}
+    \item \textbf{Interpretability}: understanding why and when predictions occur.
+    \item \textbf{Explainability}: linking model outputs to telemetry signals.
+    \item \textbf{Context awareness}: viewing predictions in their race environment.
+    \item \textbf{User engagement}: providing a hands-on experience for analysis.
+\end{itemize}
+
+It transforms the predictive engine from a purely algorithmic model into an operationally  
+useful, human-driven decision-support tool.
+
+\section*{Summary}
+
+The Streamlit dashboard acts as the front-end layer through which users interact  
+with pit stop predictions, anomaly detections, and telemetry insights.  
+It plays a crucial role in model development, evaluation, and interpretation,
+providing an accessible and powerful interface for exploring the complexity  
+of Formula 1 race data.
+
+% ============================================================
+% PART 9 — LIMITATIONS
+% ============================================================
+
+\chapter{Limitations}
+
+Although the predictive system developed in this project provides meaningful insights into 
+tyre degradation, pit windows, and telemetry anomalies, several fundamental limitations restrict 
+its predictive accuracy and operational reliability.  
+Formula 1 is an inherently chaotic environment, affected not only by mechanical and physical variables 
+but also by unpredictable events and human decisions.  
+This chapter outlines the major limitations identified throughout the project.
+
+\section{Inability to Predict Race Incidents (Safety Car, VSC, Red Flags)}
+
+One of the most significant constraints is that the model cannot anticipate race incidents such as:
+
+\begin{itemize}
+    \item crashes,
+    \item debris on track,
+    \item sudden mechanical failures of other cars,
+    \item weather-induced chaos,
+    \item Safety Car (SC) phases,
+    \item Virtual Safety Car (VSC) activations,
+    \item red flag interruptions.
+\end{itemize}
+
+These events are by nature \textbf{exogenous} to telemetry and lap-time patterns.  
+They cannot be inferred from car-level telemetry because their cause is external to the driver's vehicle.
+
+\subsection*{Impact of Safety Car on Strategy}
+
+A Safety Car intervention dramatically alters race conditions:
+
+\begin{itemize}
+    \item lap times drop by 40–60\%,
+    \item tyre degradation nearly stops,
+    \item track resets in terms of traffic distribution,
+    \item pit stop time loss is reduced by up to 10 seconds,
+    \item teams often pit opportunistically regardless of tyre condition.
+\end{itemize}
+
+From a strategic standpoint, the Safety Car introduces a situation where the optimal decision  
+depends almost entirely on \textbf{contextual race dynamics} rather than degradation or telemetry signals.
+
+\subsection*{Why the Model Cannot Decide During SC}
+
+During a Safety Car period:
+
+\begin{itemize}
+    \item the predictive model has no notion of race neutralisation,
+    \item telemetry-based degradation models become irrelevant,
+    \item anomaly detection may incorrectly flag slowed laps as abnormal,
+    \item pit urgency estimates lose strategic meaning,
+    \item only human engineers can weigh track position, tyre delta, risk, weather, and long-term strategy.
+\end{itemize}
+
+Thus, all pit decisions under SC or VSC conditions must remain \textbf{manual},  
+and the model is explicitly not designed to recommend or plan pit stops in these phases.
+
+\section{Data Limitations}
+
+\subsection{Inconsistencies in Historical Data}
+
+The FastF1 API provides telemetry of varying completeness depending on season and event.
+
+Notably, seasons such as 2018 and 2019 contain several issues:
+\begin{itemize}
+    \item missing telemetry channels (e.g., brake, throttle, or RPM),
+    \item irregular sampling,
+    \item incomplete tyre compound metadata,
+    \item inconsistent lap time deltas.
+\end{itemize}
+
+For this reason, the project focused primarily on seasons with complete telemetry.  
+This limits the temporal scope of the analysis and reduces training diversity.
+
+\subsection{Telemetry Noise and Reliability}
+
+Raw telemetry signals often contain:
+\begin{itemize}
+    \item noise due to sampling errors,
+    \item desynchronisation between channels,
+    \item missing frames,
+    \item packet drops.
+\end{itemize}
+
+Even after preprocessing, some artifacts persist and may influence anomaly detection or  
+pit window predictions.
+
+\section{Model-Specific Limitations}
+
+\subsection{Limited Interpretability of Some Pit Decisions}
+
+While XGBoost provides feature importance, the true causal mechanisms behind tyre degradation involve:
+
+\begin{itemize}
+    \item tyre temperature cycles,
+    \item surface roughness,
+    \item abrasive characteristics of asphalt,
+    \item micro-sliding and slip ratios,
+    \item heat transfer into the carcass.
+\end{itemize}
+
+These are not directly represented in telemetry, making the model inherently  
+\textbf{approximate rather than mechanistic}.
+
+\subsection{Driver-Specific Behaviour}
+
+Aggressive vs. conservative drivers may exhibit:
+
+\begin{itemize}
+    \item different braking patterns,
+    \item distinct cornering styles,
+    \item varied tyre management ability.
+\end{itemize}
+
+The model cannot fully generalise across these behavioural patterns, which limits its predictive uniformity.
+
+\subsection{Circuit Variability}
+
+Circuits differ drastically in terms of:
+
+\begin{itemize}
+    \item degradation profile (high vs. low wear),
+    \item number of slow corners,
+    \item track temperature sensitivity,
+    \item asphalt abrasion,
+    \item probability of overtaking,
+    \item pit lane time loss.
+\end{itemize}
+
+This heterogeneity makes universal modelling difficult, especially with limited training data.
+
+\section{Limitations of Anomaly Detection}
+
+As described in Chapter 6, anomaly detection models cannot reliably distinguish between:
+
+\begin{itemize}
+    \item driver mistake,
+    \item temporary tyre overheating,
+    \item traffic-induced pace loss,
+    \item yellow flag slowdowns,
+    \item aggressive tyre saving,
+    \item Safety Car phases,
+    \item sensor noise.
+\end{itemize}
+
+Many of these anomalies \textbf{do not require a pit stop},  
+but anomaly severity may incorrectly suggest one.
+
+Thus, anomaly detection is a noisy but useful indicator—not a prescriptive tool.
+
+\section{Operational Limitations}
+
+\subsection{Real-Time Deployment Constraints}
+
+Deploying such a system in a real Formula 1 team would require:
+
+\begin{itemize}
+    \item real-time telemetry ingestion at high frequency,
+    \item latency constraints below 100 ms,
+    \item integration with simulation-based strategy engines,
+    \item domain experts manually reviewing model outputs.
+\end{itemize}
+
+The current system is designed for analytical and educational purposes rather than  
+mission-critical live racing operations.
+
+\subsection{Human Expertise Remains Essential}
+
+Even with advanced predictive models, strategic decisions must be supervised by engineers who can evaluate:
+
+\begin{itemize}
+    \item traffic patterns,
+    \item undercut/overcut potential,
+    \item competitor behaviour,
+    \item weather forecasts,
+    \item team objectives,
+    \item tire allocation constraints.
+\end{itemize}
+
+Thus, the model provides \textbf{decision support}, not autonomous decision-making.
+
+\section*{Summary}
+
+This project demonstrates the feasibility of a machine learning system for analysing pit stop timing  
+and detecting anomalies in Formula 1 telemetry.  
+However, several limitations—including unpredictable race incidents, incomplete telemetry, noisy signals,  
+driver-specific behaviour, and the inherent complexity of real-world race strategy—restrict the system’s  
+predictive reach.
+
+Despite these limitations, the framework offers valuable insights and forms a solid foundation  
+for future developments, extensions, and real-time decision-support tools.
+
+% ============================================================
+% PART 10 — CONCLUSION
+% ============================================================
+
+\chapter{Conclusion}
+
+The goal of this project was to design and implement a comprehensive data-driven framework 
+capable of analysing Formula 1 telemetry, estimating pit stop timing, detecting anomalies, 
+and synthesising these signals into an interpretable decision-support tool.  
+Through the combination of advanced preprocessing, machine learning models, anomaly detection methods, 
+and an interactive dashboard, the project demonstrates how complex race dynamics can be partially 
+captured and modelled using open-source data.
+
+\section*{Summary of Contributions}
+
+Several key contributions were achieved:
+
+\begin{itemize}
+    \item Development of an extensive \textbf{preprocessing and feature engineering pipeline} capable of 
+    transforming noisy telemetry into structured, informative variables.
+
+    \item Creation of a \textbf{multi-headed XGBoost strategy model} predicting pit windows, next-lap pit probability, 
+    and expected pit timing using both stint-level and telemetry-derived indicators.
+
+    \item Implementation of a \textbf{fusion-based anomaly detection system} combining Autoencoder reconstruction error, 
+    Isolation Forest, and One-Class SVM to identify laps with abnormal behaviour.
+
+    \item Integration of all predictive signals into a \textbf{unified decision fusion mechanism} producing interpretable 
+    outputs such as \textit{Continue}, \textit{Monitor}, or \textit{Pit Now}.
+
+    \item Deployment of a \textbf{Streamlit dashboard} enabling intuitive exploration of predictions, anomalies, 
+    telemetry trends, and pit stop comparisons in a visual, user-friendly interface.
+\end{itemize}
+
+Together, these components form a cohesive and operational analytics system capable of offering 
+meaningful insights into tyre degradation, driver performance, and race strategy.
+
+\section*{Interpretation and Relevance}
+
+Although the system is not intended to replace professional team simulators or predictive engines,  
+it demonstrates that a \textbf{machine learning approach can approximate strategic reasoning} 
+based solely on publicly available telemetry and lap-time data.  
+The project highlights the potential of data-driven analysis to:
+
+\begin{itemize}
+    \item identify consistent degradation patterns,
+    \item anticipate pit windows under normal racing conditions,
+    \item detect mechanical or behavioural anomalies,
+    \item provide a structured interpretation of race dynamics.
+\end{itemize}
+
+In doing so, it offers a valuable pedagogical tool for understanding modern racing strategy.
+
+\section*{Limitations and Challenges}
+
+The project also exposed several structural limitations, including incomplete historical telemetry, 
+driver-specific behaviour variability, noise within raw signals, and the inability to predict 
+unforeseeable race incidents such as Safety Cars.  
+These challenges emphasise the inherent complexity of high-level race strategy and the 
+fundamental necessity of human oversight.
+
+\section*{Future Work}
+
+Several avenues can extend and enrich the current system:
+
+\begin{itemize}
+    \item Incorporation of \textbf{real-time inference} through streaming telemetry inputs.
+    \item Integration of \textbf{weather forecasts} and track evolution metrics.
+    \item Development of a \textbf{tyre wear simulation layer} complementing the ML predictions.
+    \item Implementation of \textbf{driver-specific calibration} to better capture individual driving styles.
+    \item Expansion to \textbf{multi-driver and multi-team comparative analysis}.
+\end{itemize}
+
+These developments would bring the system closer to operational decision tools used by professional teams.
+
+\section*{Closing Remarks}
+
+This project demonstrates that combining telemetry, machine learning, anomaly detection, and interactive 
+visualisation yields a powerful analytical framework for studying Formula 1 strategy.  
+While many real-world complexities remain beyond the scope of purely data-driven models, the results 
+provide a strong foundation for future research and applications in motorsport analytics.  
+The approach highlights the balance between algorithmic prediction and human expertise, 
+showcasing how computational insights can enhance the understanding of one of the most dynamic 
+and technically demanding sports in the world.
+
+% ============================================================
+% PART 11 — GLOSSARY
+% ============================================================
+
+\chapter*{Glossary}
+\addcontentsline{toc}{chapter}{Glossary}
+
+\begin{description}
+
+    \item[Anomaly Detection]  
+    A set of machine learning techniques used to identify laps whose telemetry
+    deviates significantly from expected patterns.
+
+    \item[Autoencoder]  
+    A neural network architecture trained to compress and reconstruct input data.
+    High reconstruction error indicates abnormal or unseen behaviour.
+
+    \item[Brake Percentage]  
+    The proportion of time within a lap during which the brake pedal is engaged.
+
+    \item[Decision Fusion]  
+    A process that combines pit strategy signals and anomaly scores into a
+    unified actionable decision score used to generate operational messages
+    such as ``Continue'', ``Monitor'', or ``Pit Now''.
+
+    \item[DRS (Drag Reduction System)]  
+    A mechanism allowing drivers to reduce aerodynamic drag on straights,
+    increasing top speed during overtaking attempts.
+
+    \item[Feature Engineering]  
+    The transformation of raw telemetry and lap data into structured, meaningful
+    variables suitable for machine learning models.
+
+    \item[Isolation Forest]  
+    An anomaly detection algorithm that isolates irregular points through random
+    partitioning; anomalies require fewer splits to isolate.
+
+    \item[Lap Delta]  
+    The difference between the lap time of the current lap and the previous lap,
+    used as a degradation or performance indicator.
+
+    \item[Next-Lap Pit Probability]  
+    The probability estimated by the binary classifier that a driver will pit on
+    the next lap.
+
+    \item[One-Class SVM]  
+    A boundary-based anomaly detection method that learns the region containing
+    normal telemetry patterns and marks external points as anomalies.
+
+    \item[Pit Stop]  
+    A race event in which a car enters the pit lane to change tyres, make
+    adjustments, or repair damage. This event strongly impacts race strategy.
+
+    \item[Pit Window]  
+    A race interval during which it is strategically optimal or mechanically
+    necessary to perform a pit stop.
+
+    \item[PitUrgency]  
+    A composite metric reflecting the likelihood and urgency of a pit stop based
+    on pit window probabilities and next-lap pit predictions.
+
+    \item[Reconstruction Error]  
+    The difference between original and reconstructed input in an Autoencoder,
+    used to quantify abnormality.
+
+    \item[Rolling Feature]  
+    A feature computed over multiple laps (e.g. rolling mean of lap time) to
+    capture temporal trends and degradation signals.
+
+    \item[Safety Car (SC)]  
+    A neutralisation procedure where the race pace is reduced drastically due to
+    incidents on track. SC periods cannot be predicted by telemetry-based models.
+
+    \item[Stint]  
+    A sequence of laps driven on one tyre set between pit stops. Tyre degradation
+    is strongly correlated with stint duration.
+
+    \item[Streamlit]  
+    A Python library enabling fast development of interactive dashboards
+    for data analysis and model interpretation.
+
+    \item[Telemetry]  
+    High-frequency sensor data collected from the car, including speed, throttle,
+    brake usage, RPM, and acceleration metrics.
+
+    \item[XGBoost]  
+    A gradient boosting method optimized for tabular data, used as the primary
+    algorithm for pit window and pit timing prediction.
+
+\end{description}
+
+% ============================================================
+% PART 12 — APPENDICES
+% ============================================================
+
+\appendix
+
+\chapter{Appendix A: Feature Table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|p{9cm}|}
+\hline
+\textbf{Feature} & \textbf{Description} \\ \hline
+LapTime & Lap time in seconds. \\ \hline
+TyreLife & Age of tyre in laps. \\ \hline
+MeanSpeed & Average speed during lap. \\ \hline
+ThrottleRatio & Percentage of full-throttle usage. \\ \hline
+BrakeRatio & Percentage of braking duration. \\ \hline
+RollingLapMean & Rolling mean lap time (3--5 laps). \\ \hline
+PaceDrift & Difference between long/short rolling windows. \\ \hline
+StintLength & Total laps in the stint. \\ \hline
+TrackTemp & Track surface temperature. \\ \hline
+DRSCount & Count of DRS activations in lap. \\ \hline
+\end{tabular}
+\caption{Main engineered features used for modelling.}
+\end{table}
+
+\chapter{Appendix B: Python File Overview}
+
+\begin{itemize}
+    \item \texttt{data\_loader.py}: session loading, filtering, dataset building.
+    \item \texttt{feature\_engineering.py}: creation of rolling windows, telemetry aggregation.
+    \item \texttt{strategy\_model.py}: XGBoost training for pit window and pit timing.
+    \item \texttt{anomaly\_model.py}: Autoencoder + Isolation Forest + One-Class SVM.
+    \item \texttt{decision\_fusion.py}: merging strategy and anomaly signals.
+    \item \texttt{dashboard.py}: Streamlit UI for interactive exploration.
+\end{itemize}
+
+\chapter{Appendix C: Methodological Notes}
+
+\begin{itemize}
+    \item Telemetry irregularities were corrected using interpolation.
+    \item Stint segmentation used tyre compound transitions.
+    \item Safety Car detection is intentionally excluded from modelling.
+\end{itemize}
+
+% ============================================================
+% PART 13 — PIPELINE TIKZ DIAGRAM
+% ============================================================
+
+\chapter{Pipeline Diagram}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.8cm, auto]
+
+\tikzstyle{block} = [
+    rectangle, 
+    draw, 
+    rounded corners,
+    text width=4cm, 
+    align=center, 
+    minimum height=1.2cm
+];
+
+\node[block] (data) {Raw Data \\ (FastF1 Telemetry, Laps, Weather)};
+\node[block, below of=data] (prep) {Data Preprocessing \\ + Feature Engineering};
+\node[block, below of=prep] (strategy) {Strategy Model \\ (XGBoost Multi-Head)};
+\node[block, right=3cm of strategy] (anomaly) {Anomaly Detection \\ (AE + IF + OCS)};
+\node[block, below of=strategy, xshift=1.5cm] (fusion) {Decision Fusion \\ (PitUrgency + AnomalySeverity)};
+\node[block, below of=fusion] (dashboard) {Streamlit Dashboard \\ (Visualization + Analysis)};
+
+\draw[->] (data) -- (prep);
+\draw[->] (prep) -- (strategy);
+\draw[->] (prep) -- (anomaly);
+\draw[->] (strategy) -- (fusion);
+\draw[->] (anomaly) -- (fusion);
+\draw[->] (fusion) -- (dashboard);
+
+\end{tikzpicture}
+\caption{End-to-end pipeline from raw telemetry to interactive decision support.}
+\end{figure}
+
+% ============================================================
+% END OF DOCUMENT
+% ============================================================
+
+\end{document}
+
