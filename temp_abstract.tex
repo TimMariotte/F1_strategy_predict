@@ -1,5 +1,0 @@
-﻿This project develops a machine learning system for predicting pit stop timing in Formula 1 races using telemetry data from the FastF1 library. The system combines a multi-headed XGBoost classifier for pit window prediction, three anomaly detection models (Autoencoder, Isolation Forest, One-Class SVM) for identifying abnormal telemetry patterns, and a decision fusion layer that generates actionable recommendations.
-
-The predictive model uses lap times, car telemetry (speed, throttle, brake, RPM), weather data, and stint information to estimate pit stop windows and detect mechanical anomalies. Due to incomplete telemetry in earlier seasons (2018-2019), the analysis focuses on races with complete data coverage. An interactive Streamlit dashboard allows users to explore predictions, compare them with actual pit stops, and analyze telemetry patterns.
-
-Results show that the system can identify pit windows across different race strategies, though limitations remain regarding unpredictable race incidents like Safety Cars and driver-specific variations.
